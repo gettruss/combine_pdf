@@ -103,6 +103,19 @@ module CombinePDF
         decryptor = PDFDecrypt.new @parsed, @root_object
         decryptor.decrypt
         # do we really need to apply to @parsed? No, there is no need.
+      else
+        # if we find for some reason that this matches against a non-encryption dictionary, we should raise an error
+        # we can make it more specific with these:
+        # obj[:P] == -12 &&
+        # obj[:V] == 1 &&
+        # obj[:R] == 2 &&
+        # obj[:Length] == 40
+        encryption_dict = @parsed.find { |obj| obj.is_a?(Hash) && obj[:Filter] == :Standard && obj[:O] && obj[:U] }
+        if encryption_dict
+          @root_object[:Encrypt] = encryption_dict
+          decryptor = PDFDecrypt.new @parsed, @root_object
+          decryptor.decrypt
+        end
       end
 
       # search for objects streams and replace them "in-place"
