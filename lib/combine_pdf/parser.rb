@@ -59,6 +59,7 @@ module CombinePDF
       @scanner = nil
       @allow_optional_content = options[:allow_optional_content]
       @raise_on_encrypted = options[:raise_on_encrypted]
+      @previous_trailers = []
     end
 
     # parse the data in the new parser (the data already set through the initialize / new method)
@@ -113,6 +114,14 @@ module CombinePDF
         encryption_dict = @parsed.find { |obj| obj.is_a?(Hash) && obj[:Filter] == :Standard && obj[:O] && obj[:U] }
         if encryption_dict
           @root_object[:Encrypt] = encryption_dict
+          if @root_object[:ID].nil? && !@previous_trailers.empty?
+            # the decrypt will fail without an ID, and there must be one, so try and find it, likely in an previous version trailer
+            @previous_trailers.each do |trailer|
+              if trailer[:ID]
+                @root_object[:ID] = trailer[:ID]
+              end
+            end
+          end
           decryptor = PDFDecrypt.new @parsed, @root_object
           decryptor.decrypt
         end
@@ -445,6 +454,10 @@ module CombinePDF
         elsif @scanner.scan(/trailer/)
           if @scanner.skip_until(/<</)
             data = _parse_
+            # we keep track of previous trailers in case we need to recover an :ID for decryption
+            if !@root_object.nil? && @root_object != {}
+              @previous_trailers << @root_object.dup
+            end
             (@root_object ||= {}).clear
             @root_object[data.shift] = data.shift while data[0]
           end
@@ -750,7 +763,12 @@ module CombinePDF
     # preffering the old over the new.
     HASH_UPDATE_PROC_FOR_OLD = Proc.new do |_key, old_data, new_data|
       if old_data.is_a? Hash
-        old_data.merge(new_data, &HASH_UPDATE_PROC_FOR_OLD)
+        # this avoids infinite recursion
+        if old_data.object_id.equal?(new_data.object_id)
+          old_data
+        else
+          old_data.merge(new_data, &HASH_UPDATE_PROC_FOR_OLD)
+        end
       else
         old_data
       end
@@ -768,7 +786,12 @@ module CombinePDF
     # preffering the new over the old.
     HASH_UPDATE_PROC_FOR_NEW = Proc.new do |_key, old_data, new_data|
       if old_data.is_a? Hash
-        old_data.merge(new_data, &HASH_UPDATE_PROC_FOR_NEW)
+        # this avoids infinite recursion
+        if old_data.object_id.equal?(new_data.object_id)
+          new_data
+        else
+          old_data.merge(new_data, &HASH_UPDATE_PROC_FOR_NEW)
+        end
       else
         new_data
       end
