@@ -25,7 +25,7 @@ module CombinePDF
       existing = {}.dup
       should_resolve = [].dup
       #set all existing objects as resolved and register their children for future resolution
-      @objects.each { |obj| existing[obj] = obj ; resolved[obj.object_id] = obj; should_resolve << obj.values}
+      @objects.each { |obj| existing[obj.object_id] = obj ; resolved[obj.object_id] = obj; should_resolve << obj.values}
       # loop until should_resolve is empty
       while should_resolve.any?
         obj = should_resolve.pop
@@ -35,7 +35,7 @@ module CombinePDF
           if referenced && referenced.any?
             tmp = resolved[referenced.object_id]
             if !tmp && referenced[:raw_stream_content]
-              tmp = existing[referenced[:raw_stream_content]]
+              tmp = existing[referenced[:raw_stream_content].object_id]
               # Avoid endless recursion by limiting it to a number of layers (default == 2)
               tmp = nil unless equal_layers(tmp, referenced)
             end
@@ -44,7 +44,7 @@ module CombinePDF
             else
               resolved[obj.object_id] = referenced
               #        existing[referenced] = referenced
-              existing[referenced[:raw_stream_content]] = referenced
+              existing[referenced[:raw_stream_content].object_id] = referenced
               should_resolve << referenced
               @objects << referenced
             end
