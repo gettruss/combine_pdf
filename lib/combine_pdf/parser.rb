@@ -484,6 +484,14 @@ module CombinePDF
         ## EOF?
         ##########################################
         elsif @scanner.scan(/\%\%EOF/)
+          # it is possible for the endobj to be missing for an Xref at the very end
+          # in this case, we attempt to recover by looking for Int, Int, Hash, and assuming
+          # the first int is the indirect generation number, and hte second is the indirect reference ID
+          if !fresh && out.length >= 3 && out[-3].is_a?(Numeric) && out[-2].is_a?(Numeric) &&
+            out[-1].is_a?(Hash) && out[-1][:Type] == :XRef
+            # We have what looks like an unfinished object definition
+            out << out.pop.merge(indirect_generation_number: out.pop, indirect_reference_id: out.pop)
+          end
           ##########
           ## If this was the last valid segment, ignore any trailing garbage
           ## (issue #49 resolution)
