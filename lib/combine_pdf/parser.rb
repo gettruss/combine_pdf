@@ -83,13 +83,11 @@ module CombinePDF
 
       unless (@parsed.select { |i| !i.is_a?(Hash) }).empty?
         # p @parsed.select
-        # drop first object if it's not a hash, and was produced by a bunch of junk at the start of the PDF that
-        # was interpreted by the parser as a float (specifically, the value 0.0)
-        if @parsed.first.is_a?(Float) && @parsed.first.zero?
-          @parsed.shift
-        else
-          raise ParsingError, 'Unknown PDF parsing error - malformed PDF file?'
-        end
+        # just drop all malformed objects - I feel somewhat confident now that this is safe without data loss
+        # because the only malformed PDF that Chrome/Adobe failed to open (aka truly Malformed) throws an
+        # error ("CombinePDF failed to parse: root is unknown") later in this codepath
+        @parsed = @parsed.select { |i| i.is_a?(Hash) }
+        # raise ParsingError, "Unknown PDF parsing error - malformed PDF file?"
       end
 
       if @root_object == {}.freeze
