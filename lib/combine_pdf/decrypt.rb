@@ -43,7 +43,7 @@ module CombinePDF
       when 1, 2
         # raise_encrypted_error
         _perform_decrypt_proc_ @objects, method(:decrypt_RC4)
-      when 4
+      when 4, 5
         # make sure CF is a Hash (as required by the PDF standard for this type of encryption).
         raise_encrypted_error unless actual_object(@encryption_dictionary[:CF]).is_a?(Hash)
 
@@ -61,6 +61,9 @@ module CombinePDF
           _perform_decrypt_proc_ @objects, method(:decrypt_RC4)
         elsif (cfilter[:CFM] == :AESV2)
           _perform_decrypt_proc_ @objects, method(:decrypt_AES)
+        elsif (cfilter[:CFM] == :AESV3)
+          raise 'AESV3 decryption is not implemented yet'
+          # _perform_decrypt_proc_ @objects, method(:decrypt_AES_V3)
         else
           raise_encrypted_error
         end
@@ -71,7 +74,11 @@ module CombinePDF
       puts e
       puts e.message
       puts e.backtrace.join("\n")
-      raise_encrypted_error
+      if e.message.include?("AESV3 decryption is not implemented yet")
+        raise e
+      else
+        raise_encrypted_error
+      end
     end
 
     protected
