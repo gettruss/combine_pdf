@@ -83,7 +83,13 @@ module CombinePDF
 
       unless (@parsed.select { |i| !i.is_a?(Hash) }).empty?
         # p @parsed.select
-        raise ParsingError, 'Unknown PDF parsing error - malformed PDF file?'
+        # drop first object if it's not a hash, and was produced by a bunch of junk at the start of the PDF that
+        # was interpreted by the parser as a float (specifically, the value 0.0)
+        if @parsed.first.is_a?(Float) && @parsed.first.zero?
+          @parsed.shift
+        else
+          raise ParsingError, 'Unknown PDF parsing error - malformed PDF file?'
+        end
       end
 
       if @root_object == {}.freeze
