@@ -430,11 +430,15 @@ module CombinePDF
     # page:: the page to which the outline will point.
     # title:: the title for the outline.
     def new_outline_node(page, title)
+      # saving the title normally results in it being saved as utf-8 without a BOM (byte-order-mark). without a BOM,
+      # pdf viewers resort to using PDFDocEncoding or Latin-1. which leads to special characters causing issues. saving
+      # as utf-16BE with a BOM solves this issue. we use utf-16 instead of 8 since its supported by older pdf versions.
+      title_utf16 = "\uFEFF".encode("UTF-16BE") + title.encode("UTF-16BE")
       {
         is_reference_only: true,
         referenced_object: {
           Count: 0,
-          Title: title,
+          Title: title_utf16,
           Dest: [
             { is_reference_only: true, referenced_object: page },
             :XYZ, nil, nil, nil
