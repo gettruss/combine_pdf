@@ -343,6 +343,79 @@ module CombinePDF
       end
     end
 
+    # Build a lookup Hash mapping page object_id to its 1-based index
+    def outline_build_page_index_by_object_id
+      mapping = {}
+      pages.each_with_index do |p, i|
+        mapping[actual_object(p).object_id] = i + 1
+      end
+      mapping
+    end
+
+    # Resolve a node's page number using its :Dest, or fallback to the first child's page
+    def outline_node_page_number(node, page_index_by_object_id)
+      node = actual_object(node)
+      dest = node[:Dest]
+      if dest && dest.is_a?(Array)
+        dest_page_ref = dest[0]
+        if dest_page_ref && dest_page_ref.is_a?(Hash)
+          page_obj = actual_object(dest_page_ref)
+          return page_index_by_object_id[page_obj.object_id]
+        end
+      end
+      if node[:First]
+        child = actual_object(node[:First])
+        return outline_node_page_number(child, page_index_by_object_id)
+      end
+      nil
+    end
+
+    # Collect siblings starting from :First following :Next
+    def outline_collect_siblings(first_ref)
+      siblings = []
+      cursor = actual_object(first_ref)
+      while cursor
+        siblings << cursor
+        cursor = cursor[:Next] ? actual_object(cursor[:Next]) : nil
+      end
+      siblings
+    end
+
+    # Recursively sort siblings for each outline grouper by page number and rewire links
+    def outline_sort_group_by_page(parent_node, page_index_by_object_id)
+      parent_node = actual_object(parent_node)
+      first_ref = parent_node[:First]
+      return unless first_ref
+
+      siblings = outline_collect_siblings(first_ref)
+
+      siblings.sort_by! do |n|
+        pn = outline_node_page_number(n, page_index_by_object_id)
+        pn ? pn : Float::INFINITY
+      end
+
+      siblings.each_with_index do |n, idx|
+        if idx.zero?
+          n.delete(:Prev)
+        else
+          n[:Prev] = { is_reference_only: true, referenced_object: siblings[idx - 1] }
+        end
+
+        if idx == siblings.length - 1
+          n.delete(:Next)
+        else
+          n[:Next] = { is_reference_only: true, referenced_object: siblings[idx + 1] }
+        end
+      end
+
+      parent_node[:First] = { is_reference_only: true, referenced_object: siblings.first }
+      parent_node[:Last]  = { is_reference_only: true, referenced_object: siblings.last }
+
+      siblings.each do |n|
+        outline_sort_group_by_page(n, page_index_by_object_id) if n[:First]
+      end
+    end
+
     # Prints the whole outline hash to a file,
     # with basic indentation and replacing raw streams with "RAW STREAM"
     # (subbing doesn't allways work that great for big streams)

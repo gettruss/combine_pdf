@@ -576,5 +576,13 @@ module CombinePDF
       go_out_outline_grouping_level
       go_outline_root
     end
+
+    def resort_outline_by_page_number
+      go_outline_root
+      return if @outlines.nil? || @outlines.empty?
+
+      page_index_by_object_id = outline_build_page_index_by_object_id
+      outline_sort_group_by_page(@outlines, page_index_by_object_id)
+    end
   end
 end
