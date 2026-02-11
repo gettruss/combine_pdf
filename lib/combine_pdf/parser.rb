@@ -154,7 +154,9 @@ module CombinePDF
           stream_data = _parse_
           id_array = []
           collection = [nil]
-          while (stream_data[0].is_a?(Numeric) && stream_data[1].is_a?(Numeric))
+          n_objects = o[:N].to_i
+          n_objects.times do
+            break unless stream_data[0].is_a?(Numeric) && stream_data[1].is_a?(Numeric)
             id_array << stream_data.shift
             stream_data.shift
           end
