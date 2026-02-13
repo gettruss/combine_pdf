@@ -139,11 +139,6 @@ module CombinePDF
           o = @parsed[i]
           # puts o.inspect
 
-          # this was added to catch CCITTFaxDecode filtered objects, which we can't handle and raise and exception
-          if o.is_a?(Hash) && o[:Type] == :XObject && o[:Subtype] == :Image && o[:Filter] == [:CCITTFaxDecode]
-            raise "CCITTFaxDecode Filter is unsupported"
-          end
-
           # only process ObjStrm objects...
           next unless o.is_a?(Hash) && o[:Type] == :ObjStm
           ## un-encode (using the correct filter) the object streams
