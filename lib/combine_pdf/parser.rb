@@ -415,6 +415,10 @@ module CombinePDF
           end
 
           # Phase 3: Full keyword search fallback (PDFium: FindStreamEndPos)
+          # After skip_until, scanner is PAST the matched keyword.
+          # "endstream" = 9 chars, "endobj" = 6 chars.
+          stream_boundary_offset = 9 # default: found via endstream
+          endobj_recovery = false
           unless length_hint_valid
             @scanner.pos = old_pos
             unless @scanner.skip_until(/endstream/)
@@ -424,18 +428,25 @@ module CombinePDF
                 raise ParsingError, "Parsing Error: PDF file error - a stream object wasn't properly closed using 'endstream'!"
               end
               warn "PDF stream recovery: 'endstream' missing, using 'endobj' as stream boundary."
-              @scanner.pos -= 6 # back up past 'endobj' so it gets parsed normally
+              stream_boundary_offset = 6
+              endobj_recovery = true
             end
           else
             # Length was valid — advance past "endstream"
             @scanner.skip_until(/endstream/)
           end
 
-          length = @scanner.pos - (old_pos + 9)
+          # Calculate stream content length.
+          # scanner.pos is past the boundary keyword, so subtract its length.
+          length = @scanner.pos - old_pos - stream_boundary_offset
           length = 0 if(length < 0)
-          length -= 1 if(@scanner.string[old_pos + length - 1] == "\n")
-          length -= 1 if(@scanner.string[old_pos + length - 1] == "\r")
+          length -= 1 if(length > 0 && @scanner.string[old_pos + length - 1] == "\n")
+          length -= 1 if(length > 0 && @scanner.string[old_pos + length - 1] == "\r")
           str = (length > 0) ? @scanner.string.slice(old_pos, length) : ''
+
+          # If we used endobj as the boundary, back up so the parser loop
+          # can see "endobj" and properly close the indirect object.
+          @scanner.pos -= 6 if endobj_recovery
 
           if out.last.is_a? Hash
             out.last[:raw_stream_content] = unify_string str.force_encoding(Encoding::ASCII_8BIT)
