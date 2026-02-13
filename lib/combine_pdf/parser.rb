@@ -413,7 +413,20 @@ module CombinePDF
 
           # raise error if the stream doesn't end.
           unless @scanner.skip_until(/endstream/)
-            raise ParsingError, "Parsing Error: PDF file error - a stream object wasn't properly closed using 'endstream'!"
+            # PDFium-style recovery: Length may have overshot past the real endstream.
+            # Rewind to stream start and try scanning from there.
+            @scanner.pos = old_pos
+            unless @scanner.skip_until(/endstream/)
+              # endstream not found at all — try endobj as a fallback boundary (like PDFium does)
+              @scanner.pos = old_pos
+              unless @scanner.skip_until(/endobj/)
+                raise ParsingError, "Parsing Error: PDF file error - a stream object wasn't properly closed using 'endstream'!"
+              end
+              # Found endobj — use its position as the stream boundary.
+              # Back up scanner so endobj will be parsed normally on the next loop iteration.
+              warn "PDF stream recovery: 'endstream' missing, using 'endobj' as stream boundary."
+              @scanner.pos -= 6 # length of 'endobj'
+            end
           end
           length = @scanner.pos - (old_pos + 9)
           length = 0 if(length < 0)
