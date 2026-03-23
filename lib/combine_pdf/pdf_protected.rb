@@ -317,7 +317,19 @@ module CombinePDF
         old_data[:First] = { is_reference_only: true, referenced_object: first }
         old_data[:Last] = { is_reference_only: true, referenced_object: last }
         parent = { is_reference_only: true, referenced_object: old_data }
+        # Guard against circular references in the outline linked list.
+        # PDFs with malformed bookmarks can have :Next pointers that loop back
+        # to an earlier node, causing an infinite loop. Use a visited set
+        # to detect and break cycles.
+        #
+        # Inspired by PDFium's FindBookmark() visited-set pattern:
+        #   https://pdfium.googlesource.com/pdfium.git/+/refs/heads/chromium/7435/fpdfsdk/fpdf_doc.cpp#60
+        # And PDFium's GetNextSibling() self-reference guard:
+        #   https://pdfium.googlesource.com/pdfium.git/+/refs/heads/chromium/7435/core/fpdfdoc/cpdf_bookmarktree.cpp#36
+        visited = {}.dup
         while pos
+          break if visited[pos.object_id]
+          visited[pos.object_id] = true
           # walking through old_data here and updating the :Parent as we go,
           # this updates the inserted new_data :Parent's as well once it is appended and the
           # loop keeps walking the appended data.
