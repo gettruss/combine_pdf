@@ -98,46 +98,170 @@ module CombinePDF
       end
     end
 
-    # Scans a binary content-stream string for PDF operators that reference
-    # named resources and adds the names to the appropriate set in +refs+.
+    # Tokenizes a PDF content stream and records resource names referenced by
+    # operators. This is a direct port of PDFium's parse loop
+    # (cpdf_streamcontentparser.cpp:1666-1689) which uses a postfix operand
+    # stack: names/numbers are pushed, then an operator keyword pops and
+    # dispatches.
     #
-    # Before scanning, strips string literals ( (...) and <...> ) and inline
-    # image data ( BI...ID <bytes> EI ) to avoid false positives from
-    # operator-like text inside non-operator data. This mirrors PDFium's
-    # behavior where the stream content parser only recognizes operators
-    # at the operator level, never inside string operands or image data.
+    # Tracked operators (matching PDFium's handler dispatch):
+    #   Do  → Handle_ExecuteXObject  — operand stack[-1] is /Name → XObject
+    #   Tf  → Handle_SetFont         — operand stack[-2] is /Name → Font
+    #   gs  → Handle_SetExtendGraphState — operand stack[-1] is /Name → ExtGState
+    #
+    # The tokenizer correctly skips:
+    #   - String literals: ( ... ) with nested parens and escapes
+    #   - Hex strings: < ... >
+    #   - Inline images: BI ... ID <binary> EI
+    #   - Dictionary delimiters: << ... >>
+    #
+    # This eliminates all regex-based scanning and the _strip_non_operator_data
+    # pre-pass, matching PDFium's architecture exactly.
     def _scan_stream_for_resource_names(data, refs)
-      clean = _strip_non_operator_data(data)
-      # /Name Do  — XObject invocation (PDFium: Handle_ExecuteXObject)
-      clean.scan(%r{/([\w.+\-]+)\s+Do(?:\s|$)}) {|m| refs[:xobject] << m[0]}
-      # /Name <size> Tf  — Font selection (PDFium: Handle_SetFont)
-      clean.scan(%r{/([\w.+\-]+)\s+[\d.]+\s+Tf(?:\s|$)}) {|m| refs[:font] << m[0]}
-      # /Name gs  — ExtGState (PDFium: Handle_SetExtendGraphState)
-      clean.scan(%r{/([\w.+\-]+)\s+gs(?:\s|$)}) {|m| refs[:extgstate] << m[0]}
-    end
+      stream = data.b
+      pos = 0
+      len = stream.bytesize
+      operands = [] # postfix operand stack (stores [type, value] pairs)
 
-    # Strips string literals and inline image data from a PDF content stream
-    # to prevent false-positive operator matches. Returns a cleaned copy.
-    #
-    # Handles:
-    #   - Literal strings: ( ... ) with balanced parentheses and \) escapes
-    #   - Hex strings: < ... >  (but not dictionary delimiters <<...>>)
-    #   - Inline images: BI <key/value pairs> ID <binary data> EI
-    def _strip_non_operator_data(data)
-      result = data.b.dup
-      # 1. Strip inline images (BI ... ID <binary> EI)
-      #    ID is followed by a single whitespace byte, then binary data until
-      #    a whitespace + EI + whitespace/EOF sequence.
-      result.gsub!(/\bBI\b.*?\bID[\s].*?[\s]EI(?:\s|$)/m, " ")
-      # 2. Strip literal strings with balanced parens
-      #    PDF strings can nest: (hello (world)) is valid.
-      #    We iteratively strip innermost (...) groups.
-      loop do
-        break unless result.gsub!(/\((?:[^()\\]|\\.)*\)/m, " ")
+      while pos < len
+        # Skip whitespace (PDF whitespace: space, tab, CR, LF, FF, null)
+        while pos < len && " \t\r\n\f\0".include?(stream.getbyte(pos).chr)
+          pos += 1
+        end
+        break if pos >= len
+
+        byte = stream.getbyte(pos)
+
+        case byte
+        when 0x25 # '%' — comment, skip to end of line
+          pos += 1
+          while pos < len && stream.getbyte(pos) != 0x0A && stream.getbyte(pos) != 0x0D
+            pos += 1
+          end
+
+        when 0x2F # '/' — name object (PDFium: ElementType::kName)
+          pos += 1
+          start = pos
+          while pos < len
+            b = stream.getbyte(pos)
+            break if b <= 0x20 || "()<>[]{}/%".include?(b.chr)
+            pos += 1
+          end
+          operands << [:name, stream[start...pos].force_encoding("BINARY")]
+
+        when 0x28 # '(' — literal string, skip with balanced parens + escapes
+          depth = 1
+          pos += 1
+          while pos < len && depth > 0
+            b = stream.getbyte(pos)
+            if b == 0x5C # backslash — skip escaped char
+              pos += 1
+            elsif b == 0x28 # '('
+              depth += 1
+            elsif b == 0x29 # ')'
+              depth -= 1
+            end
+            pos += 1
+          end
+          operands << [:other, nil]
+
+        when 0x3C # '<' — hex string or dict delimiter
+          if pos + 1 < len && stream.getbyte(pos + 1) == 0x3C
+            # '<<' dict — skip to matching '>>'
+            pos += 2
+            depth = 1
+            while pos + 1 < len && depth > 0
+              if stream.getbyte(pos) == 0x3C && stream.getbyte(pos + 1) == 0x3C
+                depth += 1
+                pos += 2
+              elsif stream.getbyte(pos) == 0x3E && stream.getbyte(pos + 1) == 0x3E
+                depth -= 1
+                pos += 2
+              else
+                pos += 1
+              end
+            end
+            operands << [:other, nil]
+          else
+            # Hex string — skip to '>'
+            pos += 1
+            pos += 1 while pos < len && stream.getbyte(pos) != 0x3E
+            pos += 1 if pos < len # skip the '>'
+            operands << [:other, nil]
+          end
+
+        when 0x5B # '[' — array, skip to ']'
+          pos += 1
+          depth = 1
+          while pos < len && depth > 0
+            b = stream.getbyte(pos)
+            depth += 1 if b == 0x5B
+            depth -= 1 if b == 0x5D
+            pos += 1
+          end
+          operands << [:other, nil]
+
+        else
+          # Read a token (keyword, number, or boolean)
+          start = pos
+          while pos < len
+            b = stream.getbyte(pos)
+            break if b <= 0x20 || "()<>[]{}/%".include?(b.chr)
+            pos += 1
+          end
+          token = stream[start...pos]
+          next if token.empty?
+
+          # Classify: number or keyword (operator)
+          if token.match?(/\A[+-]?(\d+\.?\d*|\.\d+)\z/)
+            operands << [:number, token]
+          else
+            # This is a keyword (operator) — dispatch
+            # (PDFium: cpdf_streamcontentparser.cpp:1674 → OnOperator)
+            case token
+            when "Do"
+              # Handle_ExecuteXObject: operand[-1] is /Name
+              if operands.last&.first == :name
+                refs[:xobject] << operands.last[1]
+              end
+            when "Tf"
+              # Handle_SetFont: operand[-2] is /Name, operand[-1] is size
+              if operands.length >= 2 && operands[-2]&.first == :name
+                refs[:font] << operands[-2][1]
+              end
+            when "gs"
+              # Handle_SetExtendGraphState: operand[-1] is /Name
+              if operands.last&.first == :name
+                refs[:extgstate] << operands.last[1]
+              end
+            when "BI"
+              # Inline image — skip to EI (PDFium: Handle_BeginImage)
+              # Find "ID" keyword, then skip binary data until whitespace+EI+delimiter
+              id_pos = stream.index("ID", pos)
+              if id_pos
+                pos = id_pos + 2
+                pos += 1 if pos < len && " \t\r\n\f\0".include?(stream.getbyte(pos).chr)
+                # Scan for EI preceded by whitespace and followed by whitespace/EOF
+                while pos < len
+                  ei_pos = stream.index("EI", pos)
+                  break unless ei_pos
+                  # Verify EI is preceded by whitespace and followed by whitespace/EOF
+                  before_ok = ei_pos > 0 && " \t\r\n\f\0".include?(stream.getbyte(ei_pos - 1).chr)
+                  after_ok = (ei_pos + 2 >= len) || " \t\r\n\f\0/<([".include?(stream.getbyte(ei_pos + 2).chr)
+                  if before_ok && after_ok
+                    pos = ei_pos + 2
+                    break
+                  else
+                    pos = ei_pos + 1
+                  end
+                end
+              end
+            end
+            # Clear operand stack after operator (PDFium: ClearAllParams)
+            operands.clear
+          end
+        end
       end
-      # 3. Strip hex strings (< ... >) but not dict delimiters (<< ... >>)
-      result.gsub!(/<(?!<)[^>]*>/, " ")
-      result
     end
 
     # Collects raw stream blobs and their filters from a :Contents value,
