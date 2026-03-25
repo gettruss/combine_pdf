@@ -161,6 +161,61 @@ module CombinePDF
       @forms_data.nil? || @forms_data.clear
     end
 
+    # Removes unreferenced XObject, Font, and ExtGState entries from each page's
+    # Resources dictionary. This prunes orphaned resources that were inherited
+    # from a source PDF during page extraction (split) but are never actually
+    # invoked by the page's content streams.
+    #
+    # Modeled after PDFium's RemoveUnusedResources (cpdf_pagecontentgenerator.cpp).
+    #
+    # Call this before +to_pdf+ / +save+ to produce minimal output files.
+    #
+    #   pdf = CombinePDF.new
+    #   pdf << source_pdf.pages[0]
+    #   pdf.remove_unreferenced_resources!
+    #   pdf.save "lean.pdf"
+    #
+    # Returns a Hash of stats: { pages_processed: N, xobjects_removed: N, fonts_removed: N, extgstates_removed: N }
+    def remove_unreferenced_resources!
+      stats = {pages_processed: 0, xobjects_removed: 0, fonts_removed: 0, extgstates_removed: 0}
+
+      # CombinePDF's << inserts pages by reference (not copy). This means
+      # our page Hashes may be aliased to the source parsed_pdf. PDFium's
+      # FPDF_ImportPagesByIndex deep-clones pages on import, so the source
+      # is never at risk. To achieve parity, we replace each page in our
+      # catalog with a shallow copy that has its own Resources chain.
+      # This is done via _replace_page_with_isolated_copy which swaps the
+      # page reference in the Kids array.
+      catalog = rebuild_catalog
+      kids = catalog[:Pages][:referenced_object][:Kids]
+
+      kids.each_with_index do |kid_ref, idx|
+        page = kid_ref[:referenced_object] || kid_ref
+        next unless page.is_a?(Hash) && page[:Type] == :Page
+
+        stats[:pages_processed] += 1
+
+        # Collect resource names BEFORE copying (reads are safe on shared data)
+        referenced_names = _extract_do_references(page)
+
+        # Create an isolated copy of this page with its own Resources chain.
+        # The copy shares :Contents streams (read-only) and actual resource
+        # objects (images, fonts) but owns its own resource DICTIONARIES,
+        # so deletions from the dict don't affect the source.
+        isolated_page = _shallow_copy_page(page)
+
+        # Replace the page reference in Kids
+        kids[idx] = {is_reference_only: true, referenced_object: isolated_page}
+
+        # Prune on the isolated copy
+        stats[:xobjects_removed] += _prune_resource_dict(isolated_page, :XObject, referenced_names[:xobject])
+        stats[:fonts_removed] += _prune_resource_dict(isolated_page, :Font, referenced_names[:font])
+        stats[:extgstates_removed] += _prune_resource_dict(isolated_page, :ExtGState, referenced_names[:extgstate])
+      end
+
+      stats
+    end
+
     # Save the PDF to file.
     #
     # file_name:: is a string or path object for the output.

@@ -11,6 +11,261 @@ module CombinePDF
 
     include Renderer
 
+    # Scans a page's content streams (inflating FlateDecode where needed) and
+    # returns a Hash of Sets identifying every resource name actually invoked:
+    #
+    #   { xobject: Set["Img1", "Fm2"], font: Set["F1"], extgstate: Set["GS0"] }
+    #
+    # PDF content-stream operators tracked (mirrors PDFium's
+    # RecordPageObjectResourceUsage + Handle_ExecuteXObject/Handle_SetExtendGraphState):
+    #   /Name Do     → XObject (images, forms)
+    #   /Name <sz> Tf → Font
+    #   /Name gs     → ExtGState
+    #
+    # The scanner strips string literals and inline image data before matching,
+    # preventing false positives from operator-like text inside strings or binary
+    # image data — matching PDFium's parser-level operator awareness.
+    #
+    # For Form XObjects referenced via Do, the method recursively scans their
+    # own content streams (and their own /Resources if present) so that
+    # deeply-nested resource usage is captured — matching PDFium's AddForm →
+    # form->ParseContent recursive descent.
+    def _extract_do_references(page)
+      refs = {xobject: Set.new, font: Set.new, extgstate: Set.new}
+
+      # Gather content stream blobs
+      content_streams = _collect_content_streams(page[:Contents])
+      content_streams.each do |raw, filter|
+        data = _inflate_stream(raw, filter)
+        _scan_stream_for_resource_names(data, refs)
+      end
+
+      # Recursively scan any referenced Form XObjects, since a Form's own
+      # content stream may invoke additional resources by name.
+      # PDFium does this via AddForm → CPDF_Form::ParseContent with the
+      # Form's own Resources dict.
+      resources = page[:Resources]
+      return refs unless resources.is_a?(Hash)
+      resources = resources[:referenced_object] || resources
+
+      _scan_form_xobjects_recursive(resources, refs)
+
+      refs
+    end
+
+    # Recursively scans Form XObjects' content streams for resource references.
+    # A Form XObject can have its own /Resources dict (independent of the page),
+    # and those resources may reference further Form XObjects. This matches
+    # PDFium's recursive ParseContent call inside AddForm.
+    def _scan_form_xobjects_recursive(page_resources, refs)
+      xobjects = page_resources[:XObject]
+      return unless xobjects.is_a?(Hash)
+      xobjects = xobjects[:referenced_object] || xobjects
+
+      visited = Set.new
+      queue = refs[:xobject].to_a.dup
+      while queue.any?
+        name = queue.shift
+        next if visited.include?(name)
+        visited << name
+
+        form_obj = xobjects[name.to_sym]
+        next unless form_obj.is_a?(Hash)
+        form_obj = form_obj[:referenced_object] || form_obj
+        next unless form_obj[:Subtype] == :Form && form_obj[:raw_stream_content]
+
+        form_stream = _inflate_stream(form_obj[:raw_stream_content], form_obj[:Filter])
+        before_xobj = refs[:xobject].dup
+        _scan_stream_for_resource_names(form_stream, refs)
+
+        # If the Form has its own /Resources/XObject dict, scan those too
+        form_resources = form_obj[:Resources]
+        if form_resources.is_a?(Hash)
+          form_resources = form_resources[:referenced_object] || form_resources
+          form_xobjects = form_resources[:XObject]
+          if form_xobjects.is_a?(Hash)
+            form_xobjects = form_xobjects[:referenced_object] || form_xobjects
+            # Merge form-level XObjects into our lookup so recursive scan can find them
+            form_xobjects.each do |k, v|
+              next if PRIVATE_HASH_KEYS.include?(k)
+              xobjects[k] = v unless xobjects.key?(k)
+            end
+          end
+        end
+
+        # Enqueue newly-discovered XObject names for recursive scan
+        (refs[:xobject] - before_xobj).each {|n| queue << n}
+      end
+    end
+
+    # Scans a binary content-stream string for PDF operators that reference
+    # named resources and adds the names to the appropriate set in +refs+.
+    #
+    # Before scanning, strips string literals ( (...) and <...> ) and inline
+    # image data ( BI...ID <bytes> EI ) to avoid false positives from
+    # operator-like text inside non-operator data. This mirrors PDFium's
+    # behavior where the stream content parser only recognizes operators
+    # at the operator level, never inside string operands or image data.
+    def _scan_stream_for_resource_names(data, refs)
+      clean = _strip_non_operator_data(data)
+      # /Name Do  — XObject invocation (PDFium: Handle_ExecuteXObject)
+      clean.scan(%r{/([\w.+\-]+)\s+Do(?:\s|$)}) {|m| refs[:xobject] << m[0]}
+      # /Name <size> Tf  — Font selection (PDFium: Handle_SetFont)
+      clean.scan(%r{/([\w.+\-]+)\s+[\d.]+\s+Tf(?:\s|$)}) {|m| refs[:font] << m[0]}
+      # /Name gs  — ExtGState (PDFium: Handle_SetExtendGraphState)
+      clean.scan(%r{/([\w.+\-]+)\s+gs(?:\s|$)}) {|m| refs[:extgstate] << m[0]}
+    end
+
+    # Strips string literals and inline image data from a PDF content stream
+    # to prevent false-positive operator matches. Returns a cleaned copy.
+    #
+    # Handles:
+    #   - Literal strings: ( ... ) with balanced parentheses and \) escapes
+    #   - Hex strings: < ... >  (but not dictionary delimiters <<...>>)
+    #   - Inline images: BI <key/value pairs> ID <binary data> EI
+    def _strip_non_operator_data(data)
+      result = data.b.dup
+      # 1. Strip inline images (BI ... ID <binary> EI)
+      #    ID is followed by a single whitespace byte, then binary data until
+      #    a whitespace + EI + whitespace/EOF sequence.
+      result.gsub!(/\bBI\b.*?\bID[\s].*?[\s]EI(?:\s|$)/m, " ")
+      # 2. Strip literal strings with balanced parens
+      #    PDF strings can nest: (hello (world)) is valid.
+      #    We iteratively strip innermost (...) groups.
+      loop do
+        break unless result.gsub!(/\((?:[^()\\]|\\.)*\)/m, " ")
+      end
+      # 3. Strip hex strings (< ... >) but not dict delimiters (<< ... >>)
+      result.gsub!(/<(?!<)[^>]*>/, " ")
+      result
+    end
+
+    # Collects raw stream blobs and their filters from a :Contents value,
+    # which may be a single Hash, an Array of Hashes, or indirect refs.
+    # Returns Array of [raw_bytes, filter] pairs.
+    def _collect_content_streams(contents)
+      streams = []
+      items = contents.is_a?(Array) ? contents : [contents]
+      items.each do |item|
+        next unless item.is_a?(Hash)
+        obj = item[:referenced_object] || item
+        # Handle indirect_without_dictionary wrappers
+        obj = obj[:indirect_without_dictionary] if obj.is_a?(Hash) && obj[:indirect_without_dictionary].is_a?(Array)
+        if obj.is_a?(Array)
+          obj.each do |sub|
+            next unless sub.is_a?(Hash)
+            sub = sub[:referenced_object] || sub
+            streams << [sub[:raw_stream_content], sub[:Filter]] if sub[:raw_stream_content]
+          end
+        elsif obj.is_a?(Hash) && obj[:raw_stream_content]
+          streams << [obj[:raw_stream_content], obj[:Filter]]
+        end
+      end
+      streams
+    end
+
+    # Inflates a raw stream if it uses FlateDecode. Returns the binary string.
+    def _inflate_stream(raw, filter)
+      return raw.dup unless raw && filter
+      filters = filter.is_a?(Array) ? filter : [filter]
+      data = raw.dup
+      filters.each do |f|
+        next unless f == :FlateDecode
+        begin
+          data = Zlib::Inflate.inflate(data)
+        rescue Zlib::DataError, Zlib::BufError
+          # If inflation fails, fall through with raw bytes — the Do scan may
+          # still match if the stream happens to be stored uncompressed.
+          break
+        end
+      end
+      data
+    end
+
+    # Creates a shallow copy of a page Hash with its own Resources chain.
+    # The copy shares :Contents streams and actual resource objects (images,
+    # fonts, etc.) but owns its own:
+    #   - Page hash
+    #   - :Resources wrapper + inner dict
+    #   - :XObject, :Font, :ExtGState sub-dicts
+    #
+    # This mirrors PDFium's CPDF_PageExporter::ExportPages() which deep-clones
+    # the page dictionary into the destination document, combined with
+    # CloneResourcesDictEntries() which ensures sub-dicts are not shared.
+    #
+    # The page hash is duped (shallow) so that setting page[:Resources] on the
+    # copy does NOT modify the original source page. Contents, MediaBox, etc.
+    # remain shared references (they are read-only during pruning).
+    def _shallow_copy_page(page)
+      copy = page.dup
+      copy.extend(Page_Methods) unless copy.is_a?(Page_Methods)
+      _isolate_page_resources(copy)
+      copy
+    end
+
+    # Isolates a page's Resources chain so that mutations do not affect
+    # other pages or the source parsed PDF. Creates shallow dups of:
+    #   1. The :Resources wrapper (or referenced_object)
+    #   2. Each resource sub-dict (:XObject, :Font, :ExtGState)
+    #
+    # This mirrors PDFium's IsPageResourceShared() + CloneResourcesDictEntries()
+    # pattern in cpdf_pagecontentgenerator.cpp:UpdateResourcesDict().
+    def _isolate_page_resources(page)
+      res_wrapper = page[:Resources]
+      return unless res_wrapper.is_a?(Hash)
+
+      # Dup the wrapper and the inner dict
+      if res_wrapper[:referenced_object].is_a?(Hash)
+        new_wrapper = res_wrapper.dup
+        new_wrapper[:referenced_object] = res_wrapper[:referenced_object].dup
+        page[:Resources] = new_wrapper
+        resources = new_wrapper[:referenced_object]
+      else
+        resources = res_wrapper.dup
+        page[:Resources] = resources
+      end
+
+      # Dup each resource sub-dict so deletions are isolated
+      [:XObject, :Font, :ExtGState].each do |key|
+        sub = resources[key]
+        next unless sub.is_a?(Hash)
+        if sub[:referenced_object].is_a?(Hash)
+          new_sub = sub.dup
+          new_sub[:referenced_object] = sub[:referenced_object].dup
+          resources[key] = new_sub
+        else
+          resources[key] = sub.dup
+        end
+      end
+    end
+
+    # Deletes entries from a page's resource sub-dictionary (e.g. :XObject)
+    # that are not in the +keep_names+ set.
+    #
+    # IMPORTANT: _isolate_page_resources must be called on the page first
+    # to prevent mutation of shared/aliased source data.
+    #
+    # Returns the count of entries removed.
+    def _prune_resource_dict(page, dict_key, keep_names)
+      resources = page[:Resources]
+      return 0 unless resources.is_a?(Hash)
+      resources = resources[:referenced_object] || resources
+
+      sub_dict = resources[dict_key]
+      return 0 unless sub_dict.is_a?(Hash)
+      sub_dict = sub_dict[:referenced_object] || sub_dict
+      return 0 unless sub_dict.is_a?(Hash)
+
+      keys_to_delete = []
+      sub_dict.each_key do |k|
+        next if PRIVATE_HASH_KEYS.include?(k)
+        keys_to_delete << k unless keep_names.include?(k.to_s)
+      end
+
+      keys_to_delete.each {|k| sub_dict.delete(k)}
+      keys_to_delete.length
+    end
+
     # RECORSIVE_PROTECTION = { Parent: true, Last: true}.freeze
 
     # @private
