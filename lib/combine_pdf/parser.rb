@@ -632,11 +632,45 @@ module CombinePDF
             catalogs[:MediaBox] ||= inheritance_hash[:MediaBox] if inheritance_hash[:MediaBox]
             catalogs[:CropBox] ||= inheritance_hash[:CropBox] if inheritance_hash[:CropBox]
             catalogs[:Rotate] ||= inheritance_hash[:Rotate] if inheritance_hash[:Rotate]
-            if inheritance_hash[:Resources]
-              catalogs[:Resources] ||= { referenced_object: {}, is_reference_only: true }.dup
-              catalogs[:Resources] = { referenced_object: catalogs[:Resources], is_reference_only: true } unless catalogs[:Resources][:referenced_object]
-              catalogs[:Resources][:referenced_object].update((inheritance_hash[:Resources][:referenced_object] || inheritance_hash[:Resources]), &HASH_UPDATE_PROC_FOR_OLD)
-            end
+            # Resource inheritance: if the page has no /Resources of its own,
+            # inherit the parent's whole dict. If it does, use the page's as-is.
+            #
+            # === Spec basis ===
+            # ISO 32000-1:2008 §7.7.3.4 defines four inheritable page attributes:
+            # MediaBox, CropBox, Resources, and Rotate. Inheritance is whole-value:
+            # if a page defines /Resources, it completely replaces the parent's.
+            # There is no sub-dictionary merge defined in the spec.
+            #
+            # === Reference implementations ===
+            # PDFium (Chrome's PDF engine) — CPDF_Page::GetPageAttr()
+            #   pdfium/core/fpdfapi/page/cpdf_page.cpp:84-97
+            #   Walks up the /Parent chain, returns the FIRST /Resources found.
+            #   No merge of any kind.
+            #
+            # qpdf (pikepdf's C++ core) — pushInheritedAttributesToPageInternal()
+            #   libqpdf/QPDF_pages.cc
+            #   Only sets inherited attributes on a page when !kid.contains(key).
+            #   No sub-dictionary merge.
+            #
+            # === History of the previous deep-merge (why it existed) ===
+            # Commit 0fd61e8 ("fixes related to issue #71", 2016-07-09) introduced
+            # the deep-merge to fix Scribus PDFs rendering blank. The actual bug was
+            # that the old code didn't handle CombinePDF's {:referenced_object => ...}
+            # wrappers when merging inherited resources. The fix correctly added
+            # referenced_object dereferencing, but also switched from a flat merge to
+            # a recursive deep-merge (HASH_UPDATE_PROC_FOR_OLD) into the inner
+            # resource sub-dicts (:XObject, :Font, :ExtGState). This was collateral,
+            # not intentional — the deep-merge was never needed for the Scribus fix.
+            #
+            # The deep-merge caused every page to accumulate ALL XObject/Font/ExtGState
+            # entries from the parent /Pages node, even entries belonging to other pages.
+            # A 120-page PDF with 120 images produced 66 MB single-page extracts
+            # instead of 150 KB. Re-merging those splits created a 4+ GB workpaper.
+            #
+            # This ||= restores the pre-0fd61e8 inheritance semantics (page's own
+            # Resources wins, parent inherited only if page has none) while retaining
+            # proper referenced_object handling that the codebase now does internally.
+            catalogs[:Resources] ||= inheritance_hash[:Resources] if inheritance_hash[:Resources]
             if inheritance_hash[:ColorSpace]
               catalogs[:ColorSpace] ||= { referenced_object: {}, is_reference_only: true }.dup
               catalogs[:ColorSpace] = { referenced_object: catalogs[:ColorSpace], is_reference_only: true } unless catalogs[:ColorSpace][:referenced_object]
