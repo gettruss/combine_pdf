@@ -393,45 +393,61 @@ module CombinePDF
           @scanner.pos += 1 if @scanner.peek(1) == "\n".freeze && @scanner.matched[-1] != "\n".freeze
           # advance by the publshed stream length (if any)
           old_pos = @scanner.pos
-          if(out.last.is_a?(Hash) && out.last[:Length].is_a?(Integer) && out.last[:Length] > 2)
+          length_hint_valid = false
+
+          # Phase 1: Trust the Length value and jump forward (PDFium: ReadStream)
+          if out.last.is_a?(Hash) && out.last[:Length].is_a?(Integer) && out.last[:Length] > 0
             begin
-              @scanner.pos += out.last[:Length] - 2
+              @scanner.pos = old_pos + out.last[:Length]
+
+              # Phase 2: Verify — skip EOL markers, check next token is "endstream"
+              # PDFium does: ReadEOLMarkers() then GetNextWordInternal() and memcmp("endstream")
+              @scanner.scan(/[\r\n]{0,2}/)
+              if @scanner.check(/endstream/)
+                length_hint_valid = true
+              else
+                # Length was wrong — rewind to stream start for full search
+                @scanner.pos = old_pos
+              end
             rescue RangeError
-              # Currently the scanner is just going to skip until the endstream anyway so this is safe to ignore.
+              @scanner.pos = old_pos
             end
           end
 
-          # the following was dicarded because some PDF files didn't have an EOL marker as required
-          # str = @scanner.scan_until(/(\r\n|\r|\n)endstream/)
-          # instead, a non-strict RegExp is used:
-          
-
-          # raise error if the stream doesn't end.
-          unless @scanner.skip_until(/endstream/)
-            # PDFium-style recovery: Length may have overshot past the real endstream.
-            # Rewind to stream start and try scanning from there.
+          # Phase 3: Full keyword search fallback (PDFium: FindStreamEndPos)
+          # After skip_until, scanner is PAST the matched keyword.
+          # "endstream" = 9 chars, "endobj" = 6 chars.
+          stream_boundary_offset = 9 # default: found via endstream
+          endobj_recovery = false
+          unless length_hint_valid
             @scanner.pos = old_pos
             unless @scanner.skip_until(/endstream/)
-              # endstream not found at all — try endobj as a fallback boundary (like PDFium does)
+              # endstream not found — try endobj as boundary (PDFium does this too)
               @scanner.pos = old_pos
               unless @scanner.skip_until(/endobj/)
                 raise ParsingError, "Parsing Error: PDF file error - a stream object wasn't properly closed using 'endstream'!"
               end
-              # Found endobj — use its position as the stream boundary.
-              # Back up scanner so endobj will be parsed normally on the next loop iteration.
               warn "PDF stream recovery: 'endstream' missing, using 'endobj' as stream boundary."
-              @scanner.pos -= 6 # length of 'endobj'
+              stream_boundary_offset = 6
+              endobj_recovery = true
             end
+          else
+            # Length was valid — advance past "endstream"
+            @scanner.skip_until(/endstream/)
           end
-          length = @scanner.pos - (old_pos + 9)
+
+          # Calculate stream content length.
+          # scanner.pos is past the boundary keyword, so subtract its length.
+          length = @scanner.pos - old_pos - stream_boundary_offset
           length = 0 if(length < 0)
-          length -= 1 if(@scanner.string[old_pos + length - 1] == "\n") 
-          length -= 1 if(@scanner.string[old_pos + length - 1] == "\r") 
+          length -= 1 if(length > 0 && @scanner.string[old_pos + length - 1] == "\n")
+          length -= 1 if(length > 0 && @scanner.string[old_pos + length - 1] == "\r")
           str = (length > 0) ? @scanner.string.slice(old_pos, length) : ''
 
-          # warn "CombinePDF parser: detected Stream #{str.length} bytes long #{str[0..3]}...#{str[-4..-1]}"
+          # If we used endobj as the boundary, back up so the parser loop
+          # can see "endobj" and properly close the indirect object.
+          @scanner.pos -= 6 if endobj_recovery
 
-          # need to remove end of stream
           if out.last.is_a? Hash
             out.last[:raw_stream_content] = unify_string str.force_encoding(Encoding::ASCII_8BIT)
           else
